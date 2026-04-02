@@ -1,0 +1,14 @@
+{
+  "name": "docker-ilo4-client",
+  "version": "0.1.0",
+  "private": true,
+  "description": "GTK-based iLO4 client used by docker-ilo4",
+  "license": "AGPL-3.0-or-later",
+  "dependencies": {
+    "ilo-protocol": "1.0.0-beta",
+    "node-gtk": "github:mildsunrise/node-gtk#cairo-create-for-data"
+  },
+  "scripts": {
+    "postinstall": "npm explore node-gtk -- npm run build:full"
+  }
+}

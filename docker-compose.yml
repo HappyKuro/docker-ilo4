@@ -1,0 +1,16 @@
+services:
+  ilo4:
+    container_name: docker-ilo4
+    build:
+      context: .
+    image: docker-ilo4
+    ports:
+      - "5800:5800"
+      - "5900:5900"
+    environment:
+      ILO_HOST: ${ILO_HOST:-ilo4.example.org}
+      ILO_PORT: ${ILO_PORT:-443}
+      ILO_USER: ${ILO_USER:-Administrator}
+      ILO_PASSWORD: ${ILO_PASSWORD:-change-me}
+      ILO_BUSY_POLICY: ${ILO_BUSY_POLICY:-share}
+      ILO_DEBUG_VIDEO: ${ILO_DEBUG_VIDEO:-0}
