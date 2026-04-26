@@ -44,6 +44,7 @@ Then open:
 | `ILO_PASSWORD` | iLO password. | Yes |
 | `ILO_BUSY_POLICY` | What to do if another remote console session is already active: `share`, `seize`, or `disconnect`. Defaults to `share`. | No |
 | `ILO_DEBUG_VIDEO` | Set to `1` to log screen size, first rendered blocks, and automatic resync attempts while debugging blank video. | No |
+| `ILO_MEDIA_DIR` | Directory the virtual media file chooser opens in. Defaults to `/opt/docker-ilo4/media`. | No |
 
 ## Docker Compose
 
@@ -70,10 +71,11 @@ For base GUI options like timezone, user/group ids, web auth, screen resolution,
 ## Notes
 
 - This image is focused on the remote console, keyboard/mouse input, and basic power controls.
-- Virtual media is not implemented at the moment.
+- Virtual media is available for local ISO files through the built-in iLO virtual-media session, and the app now explicitly tells iLO to connect the device so it shows up in boot options.
+- The iLO account needs virtual-media privilege enabled for mounting to work.
 - The client assumes Linux-style keycodes, matching the upstream example application.
 - iLO licensing and network access rules still apply. The iLO remote console port returned by the API must be reachable from the container.
-- The local [`media`](./media) directory is kept for convenience but ignored by Git and Docker builds, so ISO images do not get uploaded to GitHub or sent in the build context.
+- The local [`media`](./media) directory is kept for convenience, so ISO images stored there are easy to pick from the file chooser, but it is still ignored by Git and Docker builds.
 
 ## Troubleshooting
 

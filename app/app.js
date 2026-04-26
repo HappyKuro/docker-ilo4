@@ -17,6 +17,8 @@ const {
   formatMouseCommand,
   powerStatusCommands,
 } = require('ilo-protocol/rc/command');
+const VirtualMediaManager = require('./virtual-media');
+const path = require('path');
 
 const gi = require('node-gtk');
 const Gtk = gi.require('Gtk', '3.0');
@@ -126,7 +128,17 @@ async function main() {
   const client = new RestAPIClient(config.baseUrl);
   await client.loginSession(config.username, config.password);
 
+  // Initialize Virtual Media Manager
+  const vmManager = new VirtualMediaManager(client, config.host, {
+    username: config.username,
+    password: config.password,
+  });
+  let currentMediaStatus = null;
+  const sessionInfo = await client.getSessionInfo();
+  vmManager.setSessionInfo(sessionInfo);
+
   const rcInfo = await client.getRcInfo();
+  vmManager.setRemoteConsoleInfo(rcInfo);
   console.log(`Connected to ${config.host}. Protocol ${rcInfo.protocolVersion}. Features: ${Array.from(rcInfo.optionalFeatures).join(', ')}`);
 
   const rcSocket = net.connect({ host: config.host, port: rcInfo.rcPort });
@@ -457,16 +469,109 @@ async function main() {
   powerButtons.packStart(makePowerButton('Power Cycle', powerStatusCommands.POWER_CYCLE, telnet), false, true, 0);
   powerButtons.packStart(makePowerButton('System Reset', powerStatusCommands.SYSTEM_RESET, telnet), false, true, 0);
 
+  // Virtual Media Controls
+  const vmButton = new Gtk.Button();
+  vmButton.label = 'Mount ISO';
+  vmButton.focusOnClick = false;
+  vmButton.on('clicked', () => {
+    const dialog = new Gtk.FileChooserDialog({
+      title: 'Select ISO Image',
+      action: Gtk.FileChooserAction.OPEN,
+    });
+    if (typeof dialog.setCurrentFolder === 'function') {
+      try {
+        dialog.setCurrentFolder(vmManager.mediaDir);
+      } catch (_error) {}
+    }
+    dialog.addButton(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL);
+    dialog.addButton(Gtk.STOCK_OPEN, Gtk.ResponseType.ACCEPT);
+
+    const isoFilter = new Gtk.FileFilter();
+    isoFilter.setName('ISO/IMG Images');
+    isoFilter.addPattern('*.iso');
+    isoFilter.addPattern('*.ISO');
+    isoFilter.addPattern('*.img');
+    isoFilter.addPattern('*.IMG');
+    dialog.addFilter(isoFilter);
+
+    const allFilter = new Gtk.FileFilter();
+    allFilter.setName('All Files');
+    allFilter.addPattern('*');
+    dialog.addFilter(allFilter);
+
+    if (dialog.run() === Gtk.ResponseType.ACCEPT) {
+      const filePath = dialog.getFilename();
+      dialog.destroy();
+
+      console.log(`Selected file: ${filePath}`);
+      updateStatus('Mounting virtual media...');
+      vmManager.insertLocalMedia(filePath, 1).then(() => {
+        const fileName = path.basename(filePath);
+        vmStatusLabel.label = `Virtual Media: ${fileName}`;
+        updateStatus(`Virtual media mounted: ${fileName}`);
+        currentMediaStatus = filePath;
+        vmButton.label = 'Unmount ISO';
+        vmUnmountButton.sensitive = true;
+        console.log(`Successfully mounted ISO: ${fileName}`);
+      }).catch((error) => {
+        updateStatus(`Failed to mount media: ${formatError(error)}`);
+        console.error(`Mount error: ${error.message}`);
+        console.error(`Full error:`, error);
+      });
+    } else {
+      dialog.destroy();
+    }
+  });
+
+  const vmUnmountButton = new Gtk.Button();
+  vmUnmountButton.label = 'Unmount ISO';
+  vmUnmountButton.focusOnClick = false;
+  vmUnmountButton.sensitive = false;
+  vmUnmountButton.on('clicked', () => {
+    updateStatus('Unmounting virtual media...');
+    vmManager.unmountMedia(1).then(() => {
+      updateStatus('Virtual media unmounted');
+      vmStatusLabel.label = 'Virtual Media: Not mounted';
+      currentMediaStatus = null;
+      vmButton.label = 'Mount ISO';
+      vmUnmountButton.sensitive = false;
+      console.log('Successfully unmounted ISO');
+    }).catch((error) => {
+      updateStatus(`Failed to unmount media: ${formatError(error)}`);
+      console.error(`Unmount error: ${error.message}`);
+    });
+  });
+
+  const vmStatusLabel = new Gtk.Label();
+  vmStatusLabel.xalign = 0;
+  vmStatusLabel.label = 'Virtual Media: Not mounted';
+  vmStatusLabel.visible = true;
+
+  const vmBox = new Gtk.Box();
+  vmBox.orientation = Gtk.Orientation.VERTICAL;
+  vmBox.spacing = 4;
+  
+  const vmButtonBox = new Gtk.Box();
+  vmButtonBox.orientation = Gtk.Orientation.HORIZONTAL;
+  vmButtonBox.spacing = 8;
+  vmButtonBox.packStart(vmButton, false, true, 0);
+  vmButtonBox.packStart(vmUnmountButton, false, true, 0);
+  
+  vmBox.packStart(vmStatusLabel, false, true, 0);
+  vmBox.packStart(vmButtonBox, false, true, 0);
+
   const container = new Gtk.Box();
   container.orientation = Gtk.Orientation.VERTICAL;
   container.spacing = 8;
   container.packStart(frameBox, true, false, 0);
   container.packStart(statusLabel, false, true, 0);
   container.packStart(powerButtons, false, true, 0);
+  container.packStart(vmBox, false, true, 0);
 
   window.add(container);
   window.on('destroy', () => {
     quitting = true;
+    void vmManager.unmountMedia(1).catch(() => {});
     try {
       rcSocket.end();
     } catch (_error) {}
@@ -482,6 +587,31 @@ async function main() {
     window.realize();
   }
   drawingArea.grabFocus();
+
+  // Initialize virtual media status
+  vmManager.getMediaDevices().then((devices) => {
+    if (devices.length > 0) {
+      console.log(`Found ${devices.length} virtual media device(s)`);
+      return vmManager.isMediaMounted(1);
+    }
+    return false;
+  }).then((isMounted) => {
+    if (isMounted) {
+      vmManager.getMountedImage(1).then((image) => {
+        if (image) {
+          const fileName = path.basename(image);
+          vmStatusLabel.label = `Virtual Media: ${fileName}`;
+          vmButton.label = 'Unmount ISO';
+          vmUnmountButton.sensitive = true;
+          currentMediaStatus = image;
+          console.log(`Current media: ${image}`);
+        }
+      });
+    }
+  }).catch((error) => {
+    console.warn(`Virtual media initialization warning: ${formatError(error)}`);
+    // This is non-critical, so don't fail the whole app
+  });
 
   rcSocket.on('end', () => {
     if (!quitting) {

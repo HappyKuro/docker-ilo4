@@ -24,6 +24,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY app/app.js ./app.js
+COPY app/virtual-media.js ./virtual-media.js
 
 FROM jlesage/baseimage-gui:debian-12-v4
 
