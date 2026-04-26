@@ -278,7 +278,7 @@ class VirtualMediaManager {
       .replace(/'/g, '&apos;');
   }
 
-  async sendRibcl(xmlBody) {
+  async sendRibcl(xmlBody, options = {}) {
     if (!this.username || !this.password) {
       throw new Error('iLO credentials are not available for virtual media control');
     }
@@ -288,13 +288,16 @@ class VirtualMediaManager {
       throw new Error('Unable to determine the iLO base URL');
     }
 
+    const blockName = options.blockName || 'RIB_INFO';
+    const mode = options.mode || 'write';
+
     const requestBody =
       '<?xml version="1.0"?>\r\n' +
       '<RIBCL VERSION="2.0">\r\n' +
       `<LOGIN USER_LOGIN="${this.escapeXml(this.username)}" PASSWORD="${this.escapeXml(this.password)}">\r\n` +
-      '<RIB_INFO MODE="write">\r\n' +
+      `<${blockName} MODE="${mode}">\r\n` +
       xmlBody +
-      '\r\n</RIB_INFO>\r\n' +
+      `\r\n</${blockName}>\r\n` +
       '</LOGIN>\r\n' +
       '</RIBCL>\r\n';
 
@@ -345,6 +348,14 @@ class VirtualMediaManager {
     }
 
     return responseBody;
+  }
+
+  async setOneTimeBoot(bootType = 'CDROM') {
+    await this.sendRibcl(
+      `<SET_ONE_TIME_BOOT value="${this.escapeXml(bootType)}"/>`,
+      { blockName: 'SERVER_INFO', mode: 'write' }
+    );
+    console.log(`One-time boot set to ${bootType}`);
   }
 
   async connectVirtualMedia(deviceIndex = 1) {
@@ -552,15 +563,33 @@ class VirtualMediaManager {
     await this.closeCurrentSession('replacing current virtual media');
 
     const session = new VirtualMediaSession(this, resolvedPath, deviceIndex);
+    let bootArmed = false;
     try {
       session.fileHandle = await fs.promises.open(resolvedPath, 'r');
       await session.connect();
       await this.connectVirtualMedia(deviceIndex);
+      try {
+        // Keep the next server boot pointed at the mounted ISO so we do not
+        // depend on iLO refreshing the boot menu in place.
+        await this.setOneTimeBoot('CDROM');
+        bootArmed = true;
+      } catch (error) {
+        console.warn(`Unable to arm virtual media for the next boot: ${error.message}`);
+      }
       await this.waitForInserted(deviceIndex);
       this.currentSession = session;
       console.log(`Virtual media mounted: ${session.fileName}`);
-      return await this.getDeviceStatus(deviceIndex);
+      const status = await this.getDeviceStatus(deviceIndex);
+      status.bootArmed = bootArmed;
+      return status;
     } catch (error) {
+      if (bootArmed) {
+        try {
+          await this.setOneTimeBoot('NORMAL');
+        } catch (clearError) {
+          console.warn(`Unable to clear one-time boot override after failure: ${clearError.message}`);
+        }
+      }
       await session.destroy('failed to mount virtual media');
       throw new Error(`Failed to mount virtual media: ${error.message}`);
     }
@@ -577,6 +606,12 @@ class VirtualMediaManager {
       await this.disconnectVirtualMedia(deviceIndex);
     } catch (error) {
       console.warn(`Virtual media disconnect warning: ${error.message}`);
+    }
+    try {
+      // Clear any boot override so unmount behaves like a clean detach.
+      await this.setOneTimeBoot('NORMAL');
+    } catch (error) {
+      console.warn(`Unable to clear one-time boot override: ${error.message}`);
     }
     await session.destroy('virtual media unmounted');
     console.log(`Virtual media unmounted from device ${deviceIndex}`);

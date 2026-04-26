@@ -64,7 +64,7 @@ const imagePath = await vmManager.getMountedImage(1);
 ## Notes
 
 - Remote URLs are not supported by the current virtual media transport.
-- Boot-order automation is not currently wired into the GUI.
+- Mounting the ISO now also arms the next boot for the virtual CD-ROM, and unmounting clears that override.
 - No extra HTTP server or additional container port is required for virtual media.
 
 ## Error Handling

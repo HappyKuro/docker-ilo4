@@ -71,7 +71,7 @@ For base GUI options like timezone, user/group ids, web auth, screen resolution,
 ## Notes
 
 - This image is focused on the remote console, keyboard/mouse input, and basic power controls.
-- Virtual media is available for local ISO files through the built-in iLO virtual-media session, and the app now explicitly tells iLO to connect the device so it shows up in boot options.
+- Virtual media is available for local ISO files through the built-in iLO virtual-media session, and the app explicitly tells iLO to connect the device and arms the next boot for the mounted ISO.
 - The iLO account needs virtual-media privilege enabled for mounting to work.
 - The client assumes Linux-style keycodes, matching the upstream example application.
 - iLO licensing and network access rules still apply. The iLO remote console port returned by the API must be reachable from the container.

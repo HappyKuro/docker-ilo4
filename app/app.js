@@ -505,14 +505,20 @@ async function main() {
 
       console.log(`Selected file: ${filePath}`);
       updateStatus('Mounting virtual media...');
-      vmManager.insertLocalMedia(filePath, 1).then(() => {
+      vmManager.insertLocalMedia(filePath, 1).then((deviceStatus) => {
         const fileName = path.basename(filePath);
+        const bootArmed = Boolean(deviceStatus && deviceStatus.bootArmed);
         vmStatusLabel.label = `Virtual Media: ${fileName}`;
-        updateStatus(`Virtual media mounted: ${fileName}`);
+        updateStatus(
+          `Virtual media mounted: ${fileName}\n` +
+          (bootArmed
+            ? `The next boot has been armed for the mounted ISO. Use System Reset or Power Cycle when you are ready.`
+            : `If the One-Time Boot Menu is already open, exit and re-enter it so iLO refreshes the list.`)
+        );
         currentMediaStatus = filePath;
         vmButton.label = 'Unmount ISO';
         vmUnmountButton.sensitive = true;
-        console.log(`Successfully mounted ISO: ${fileName}`);
+        console.log(`Successfully mounted ISO: ${fileName}${bootArmed ? ' (boot armed)' : ''}`);
       }).catch((error) => {
         updateStatus(`Failed to mount media: ${formatError(error)}`);
         console.error(`Mount error: ${error.message}`);
