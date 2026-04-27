@@ -45,6 +45,8 @@ Then open:
 | `ILO_BUSY_POLICY` | What to do if another remote console session is already active: `share`, `seize`, or `disconnect`. Defaults to `share`. | No |
 | `ILO_DEBUG_VIDEO` | Set to `1` to log screen size, first rendered blocks, and automatic resync attempts while debugging blank video. | No |
 | `ILO_MEDIA_DIR` | Directory the virtual media file chooser opens in. Defaults to `/opt/docker-ilo4/media`. | No |
+| `ILO_STARTUP_RETRY_SECONDS` | Seconds to wait before retrying transient iLO startup errors such as HTTP 500 or no free sessions. Defaults to `10`. | No |
+| `ILO_STARTUP_MAX_ATTEMPTS` | Maximum transient startup retry attempts. Use `0` to retry forever. Defaults to `0`. | No |
 
 ## Docker Compose
 

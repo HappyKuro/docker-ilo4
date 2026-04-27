@@ -2,7 +2,7 @@
 
 ## Overview
 
-The docker-ilo4 application can mount local ISO files through the iLO 4 virtual-media socket protocol. When you select an image in the GUI, the client opens a dedicated virtual-media session, streams the file directly to iLO, and explicitly tells iLO to connect the virtual CD-ROM so it appears in boot options.
+The docker-ilo4 application can mount local ISO files through the iLO 4 virtual-media socket protocol provided by `ilo-protocol`. When you select an image in the GUI, the client opens a dedicated virtual-media session and streams the file directly to iLO as a virtual CD-ROM.
 
 ## Features
 
@@ -72,7 +72,7 @@ const imagePath = await vmManager.getMountedImage(1);
 All virtual media operations include comprehensive error handling:
 
 - Failed file access or protocol setup is logged to the console
-- If iLO does not report the media as connected, the mount is treated as a failure instead of pretending success
+- The socket/SCSI session is treated as the source of truth, because iLO REST status may report socket media with `vm_connected` instead of `image_inserted`
 - User-friendly error messages are displayed in the status area
 - Connection errors gracefully degrade functionality
 

@@ -9,6 +9,8 @@ const { fileURLToPath } = require('url');
 const { negotiateConnection, DeviceType } = require('ilo-protocol/vm/handshake');
 const { VirtualDevice } = require('ilo-protocol/vm/scsi');
 
+const CDROM_DEVICE = 'CDROM';
+
 /**
  * Virtual media manager for iLO 4.
  *
@@ -151,21 +153,57 @@ class VirtualMediaSession {
 
     this.connecting = true;
     try {
-      console.log(`Connecting virtual media session for ${this.fileName} to ${host}:${this.manager.rcInfo.vmPort}`);
-      this.socket = net.connect({ host, port: this.manager.rcInfo.vmPort });
-      this.socket.setNoDelay(true);
-      await once(this.socket, 'connect');
+      const keys = await this.manager.getVirtualMediaKeys();
+      let lastError = null;
 
-      await negotiateConnection(this.socket, this.manager.client.sessionKey, this.manager.rcInfo, {
-        deviceType: DeviceType.CDROM,
-        targetIsDevice: false,
-      });
+      for (const keyInfo of keys) {
+        try {
+          await this.connectWithKey(host, keyInfo);
+          lastError = null;
+          break;
+        } catch (error) {
+          lastError = error;
+          console.warn(`Virtual media handshake failed with ${keyInfo.label}: ${error.message}`);
+        }
+      }
+
+      if (lastError) {
+        throw lastError;
+      }
 
       this.device.attachSocket(this.socket);
       await this.device.start();
       console.log(`Virtual media session established for ${this.fileName}`);
     } finally {
       this.connecting = false;
+    }
+  }
+
+  async connectWithKey(host, keyInfo) {
+    console.log(
+      `Connecting virtual media session for ${this.fileName} to ${host}:${this.manager.rcInfo.vmPort} ` +
+        `using ${keyInfo.label}`
+    );
+
+    const socket = net.connect({ host, port: this.manager.rcInfo.vmPort });
+    socket.setNoDelay(true);
+
+    try {
+      await this.manager.withTimeout(once(socket, 'connect'), 7000, 'Timed out connecting to iLO virtual media port');
+      const vmVersion = await this.manager.withTimeout(
+        negotiateConnection(socket, keyInfo.key, this.manager.rcInfo, {
+          deviceType: DeviceType.CDROM,
+          targetIsDevice: false,
+        }),
+        7000,
+        'Timed out during iLO virtual media handshake'
+      );
+
+      this.socket = socket;
+      console.log(`Connected to virtual media protocol ${vmVersion.join('.')} with ${keyInfo.label}`);
+    } catch (error) {
+      socket.destroy();
+      throw error;
     }
   }
 
@@ -269,6 +307,70 @@ class VirtualMediaManager {
     this.sessionInfo = sessionInfo;
   }
 
+  withTimeout(promise, timeoutMs, message) {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    });
+
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+  }
+
+  normalizeFlag(value) {
+    return value === 1 || value === '1' || value === true;
+  }
+
+  getDeviceName(_deviceIndex = 1) {
+    // The GUI only mounts ISO images, so always target the virtual CD-ROM.
+    return CDROM_DEVICE;
+  }
+
+  getVmStatusOption(vmStatus, deviceIndex = 1) {
+    if (!vmStatus || !Array.isArray(vmStatus.options)) {
+      return null;
+    }
+
+    const deviceName = this.getDeviceName(deviceIndex);
+    const matchingDevice = vmStatus.options.find(
+      (option) => String(option.device || '').toUpperCase() === deviceName
+    );
+
+    if (matchingDevice) {
+      return matchingDevice;
+    }
+
+    return vmStatus.options[deviceIndex - 1] || vmStatus.options[0] || null;
+  }
+
+  isVmOptionActive(option) {
+    if (!option) {
+      return false;
+    }
+
+    return (
+      this.normalizeFlag(option.image_inserted) ||
+      this.normalizeFlag(option.vm_connected) ||
+      this.normalizeFlag(option.vm_url_connected)
+    );
+  }
+
+  normalizeVmOption(option, deviceIndex = 1, legacyBios = 0) {
+    if (!option) {
+      return null;
+    }
+
+    return {
+      ...option,
+      image_inserted: this.normalizeFlag(option.image_inserted) ? 1 : 0,
+      vm_url_connected: this.normalizeFlag(option.vm_url_connected) ? 1 : 0,
+      vm_connected: this.normalizeFlag(option.vm_connected) ? 1 : 0,
+      write_protect_flag: this.normalizeFlag(option.write_protect_flag) ? 1 : 0,
+      device: option.device || this.getDeviceName(deviceIndex),
+      deviceIndex,
+      legacy_bios: legacyBios,
+    };
+  }
+
   escapeXml(value) {
     return String(value ?? '')
       .replace(/&/g, '&amp;')
@@ -276,6 +378,129 @@ class VirtualMediaManager {
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;')
       .replace(/'/g, '&apos;');
+  }
+
+  async requestIloText(pathname) {
+    const baseUrl = this.client && this.client.base ? new URL(this.client.base) : null;
+    if (!baseUrl) {
+      throw new Error('Unable to determine the iLO base URL');
+    }
+
+    return new Promise((resolve, reject) => {
+      const headers = {};
+
+      if (this.client && this.client.sessionKey) {
+        headers.Cookie = `sessionKey=${this.client.sessionKey.toString('hex')}`;
+      }
+
+      const request = https.request(
+        {
+          protocol: baseUrl.protocol,
+          hostname: baseUrl.hostname,
+          port: baseUrl.port || 443,
+          path: pathname,
+          method: 'GET',
+          rejectUnauthorized: false,
+          headers,
+        },
+        (response) => {
+          const chunks = [];
+          response.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+          response.on('end', () => {
+            const body = Buffer.concat(chunks).toString('utf8');
+            if (response.statusCode < 200 || response.statusCode >= 300) {
+              reject(new Error(`HTTP ${response.statusCode}: ${body.slice(0, 120)}`));
+              return;
+            }
+            resolve(body);
+          });
+        }
+      );
+
+      request.setTimeout(7000, () => request.destroy(new Error(`Timed out reading ${pathname} from iLO`)));
+      request.on('error', reject);
+      request.end();
+    });
+  }
+
+  extractInfo0Keys(pageBody) {
+    const keys = [];
+
+    const addHex = (label, hexValue) => {
+      if (!/^[0-9a-fA-F]{32}$/.test(hexValue)) {
+        return;
+      }
+
+      keys.push({
+        label,
+        key: Buffer.from(hexValue, 'hex'),
+      });
+    };
+
+    for (const match of String(pageBody).matchAll(/INFO0\\?=\\?"?([^"\r\n<]+)/g)) {
+      const rawValue = match[1].replace(/\\$/, '');
+
+      for (const hexMatch of rawValue.matchAll(/[0-9a-fA-F]{32}/g)) {
+        addHex('Java IRC INFO0 key', hexMatch[0]);
+      }
+
+      let decodedValue = '';
+      try {
+        decodedValue = Buffer.from(rawValue, 'base64').toString('utf8');
+      } catch (_error) {}
+
+      for (const hexMatch of decodedValue.matchAll(/[0-9a-fA-F]{32}/g)) {
+        addHex('Java IRC decoded INFO0 key', hexMatch[0]);
+      }
+    }
+
+    return keys;
+  }
+
+  async getVirtualMediaKeys() {
+    const keys = [];
+    const seen = new Set();
+
+    const addKey = (label, key) => {
+      if (!key) {
+        return;
+      }
+
+      const buffer = Buffer.isBuffer(key) ? key : Buffer.from(key, 'hex');
+      if (buffer.length !== 16) {
+        return;
+      }
+
+      const keyHex = buffer.toString('hex');
+      if (seen.has(keyHex)) {
+        return;
+      }
+
+      seen.add(keyHex);
+      keys.push({ label, key: buffer });
+    };
+
+    addKey('REST login session key', this.client && this.client.sessionKey);
+
+    if (this.rcInfo) {
+      addKey('remote console VM key', this.rcInfo.vmKey);
+      addKey('remote console command key', this.rcInfo.cmdEncKey);
+    }
+
+    try {
+      const javaIrcPage = await this.requestIloText('/html/java_irc.html');
+      for (const keyInfo of this.extractInfo0Keys(javaIrcPage)) {
+        addKey(keyInfo.label, keyInfo.key);
+      }
+    } catch (error) {
+      console.warn(`Unable to read Java IRC launch keys for virtual media: ${error.message}`);
+    }
+
+    if (keys.length === 0) {
+      throw new Error('No virtual media handshake keys are available');
+    }
+
+    return keys;
   }
 
   async sendRibcl(xmlBody, options = {}) {
@@ -330,21 +555,27 @@ class VirtualMediaManager {
         }
       );
 
+      request.setTimeout(7000, () => request.destroy(new Error('Timed out waiting for iLO RIBCL response')));
       request.on('error', reject);
       request.end(requestBody);
     });
 
-    const statusMatch = /<RESPONSE\b[^>]*STATUS=["']([^"']+)["']/i.exec(responseBody);
-    const messageMatch = /<RESPONSE\b[^>]*(?:MESSAGE|MSG)=["']([^"']*)["']/i.exec(responseBody);
-    const status = statusMatch ? statusMatch[1] : null;
-    const message = messageMatch ? messageMatch[1] : 'Unknown RIBCL response';
+    const responseMatches = Array.from(responseBody.matchAll(/<RESPONSE\b([^>]*)>/gi));
 
-    if (status && status !== '0x0000') {
-      throw new Error(`iLO RIBCL error ${status}: ${message}`);
+    if (responseMatches.length === 0) {
+      throw new Error(`Unable to parse RIBCL response: ${responseBody.slice(0, 200)}`);
     }
 
-    if (!statusMatch) {
-      throw new Error(`Unable to parse RIBCL response: ${responseBody.slice(0, 200)}`);
+    for (const match of responseMatches) {
+      const attrs = match[1];
+      const statusMatch = /STATUS=["']([^"']+)["']/i.exec(attrs);
+      const messageMatch = /(?:MESSAGE|MSG)=["']([^"']*)["']/i.exec(attrs);
+      const status = statusMatch ? statusMatch[1] : null;
+      const message = messageMatch ? messageMatch[1] : 'Unknown RIBCL response';
+
+      if (status && status !== '0x0000') {
+        throw new Error(`iLO RIBCL error ${status}: ${message}`);
+      }
     }
 
     return responseBody;
@@ -360,7 +591,7 @@ class VirtualMediaManager {
 
   async connectVirtualMedia(deviceIndex = 1) {
     await this.sendRibcl(
-      `<SET_VM_STATUS DEVICE="CDROM">\r\n` +
+      `<SET_VM_STATUS DEVICE="${this.getDeviceName(deviceIndex)}">\r\n` +
         `<VM_BOOT_OPTION VALUE="CONNECT"/>\r\n` +
         `<VM_WRITE_PROTECT VALUE="YES"/>\r\n` +
         `</SET_VM_STATUS>`
@@ -370,7 +601,7 @@ class VirtualMediaManager {
 
   async disconnectVirtualMedia(deviceIndex = 1) {
     await this.sendRibcl(
-      `<SET_VM_STATUS DEVICE="CDROM">\r\n` +
+      `<SET_VM_STATUS DEVICE="${this.getDeviceName(deviceIndex)}">\r\n` +
         `<VM_BOOT_OPTION VALUE="DISCONNECT"/>\r\n` +
         `</SET_VM_STATUS>`
     );
@@ -423,7 +654,7 @@ class VirtualMediaManager {
 
     return [
       {
-        device: 'CDROM',
+        device: CDROM_DEVICE,
         deviceIndex: 1,
         vmPort: this.rcInfo.vmPort,
       },
@@ -450,19 +681,16 @@ class VirtualMediaManager {
 
     const vmStatus = await this.fetchVmStatus();
     if (vmStatus && Array.isArray(vmStatus.options)) {
-      const option = vmStatus.options[deviceIndex - 1] || vmStatus.options[0];
-      if (option) {
-        return {
-          ...option,
-          image_inserted: Number(option.image_inserted) === 1 ? 1 : 0,
-          device: deviceIndex,
-          legacy_bios: vmStatus.legacy_bios,
-        };
+      const option = this.getVmStatusOption(vmStatus, deviceIndex);
+      const status = this.normalizeVmOption(option, deviceIndex, vmStatus.legacy_bios);
+      if (status) {
+        return status;
       }
     }
 
     return {
-      device: deviceIndex,
+      device: this.getDeviceName(deviceIndex),
+      deviceIndex,
       image_inserted: 0,
       image_url: '',
       image_url_file: '',
@@ -475,12 +703,12 @@ class VirtualMediaManager {
 
   async isMediaMounted(deviceIndex = 1) {
     const status = await this.getDeviceStatus(deviceIndex);
-    return Boolean(status && Number(status.image_inserted) === 1);
+    return this.isVmOptionActive(status);
   }
 
   async getMountedImage(deviceIndex = 1) {
     const status = await this.getDeviceStatus(deviceIndex);
-    if (status && Number(status.image_inserted) === 1) {
+    if (this.isVmOptionActive(status)) {
       return status.image_url_file || status.image_url || null;
     }
     return null;
@@ -495,10 +723,10 @@ class VirtualMediaManager {
       const vmStatus = await this.fetchVmStatus();
       if (vmStatus && Array.isArray(vmStatus.options)) {
         sawVmStatus = true;
-        const option = vmStatus.options[deviceIndex - 1] || vmStatus.options[0];
+        const option = this.getVmStatusOption(vmStatus, deviceIndex);
         if (option) {
           lastStatus = option;
-          if (Number(option.image_inserted) === 1) {
+          if (this.isVmOptionActive(option)) {
             return option;
           }
         }
@@ -508,10 +736,12 @@ class VirtualMediaManager {
     }
 
     if (sawVmStatus) {
-      throw new Error(
-        `iLO did not report the virtual media image as inserted after connecting` +
-          (lastStatus ? ` (last status: ${JSON.stringify(lastStatus)})` : '')
+      console.warn(
+        `iLO REST status did not mark the virtual CD-ROM active after connecting` +
+          (lastStatus ? ` (last status: ${JSON.stringify(lastStatus)})` : '') +
+          `. Keeping the socket session mounted because the SCSI handshake succeeded.`
       );
+      return lastStatus;
     }
 
     return null;
@@ -560,14 +790,24 @@ class VirtualMediaManager {
       throw new Error('This iLO account does not have virtual media privilege enabled');
     }
 
+    console.log(`Preparing virtual CD-ROM mount for ${path.basename(resolvedPath)} (${stat.size} bytes)`);
     await this.closeCurrentSession('replacing current virtual media');
 
     const session = new VirtualMediaSession(this, resolvedPath, deviceIndex);
     let bootArmed = false;
+    let ribclConnected = false;
     try {
       session.fileHandle = await fs.promises.open(resolvedPath, 'r');
       await session.connect();
-      await this.connectVirtualMedia(deviceIndex);
+      this.currentSession = session;
+
+      try {
+        await this.connectVirtualMedia(deviceIndex);
+        ribclConnected = true;
+      } catch (error) {
+        console.warn(`Unable to send iLO virtual media CONNECT command: ${error.message}`);
+      }
+
       try {
         // Keep the next server boot pointed at the mounted ISO so we do not
         // depend on iLO refreshing the boot menu in place.
@@ -577,12 +817,15 @@ class VirtualMediaManager {
         console.warn(`Unable to arm virtual media for the next boot: ${error.message}`);
       }
       await this.waitForInserted(deviceIndex);
-      this.currentSession = session;
       console.log(`Virtual media mounted: ${session.fileName}`);
       const status = await this.getDeviceStatus(deviceIndex);
       status.bootArmed = bootArmed;
+      status.ribclConnected = ribclConnected;
       return status;
     } catch (error) {
+      if (this.currentSession === session) {
+        this.currentSession = null;
+      }
       if (bootArmed) {
         try {
           await this.setOneTimeBoot('NORMAL');

@@ -108,6 +108,79 @@ function formatError(error) {
   return error.message || String(error);
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function readIntegerEnv(name, defaultValue) {
+  const value = Number(process.env[name] || defaultValue);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`Invalid ${name}: ${process.env[name]}`);
+  }
+  return value;
+}
+
+function isRetryableStartupError(error) {
+  const statusCode = error && error.response && error.response.statusCode;
+  if ([408, 429, 500, 502, 503, 504].includes(statusCode)) {
+    return true;
+  }
+
+  const code = error && error.code;
+  if (['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH'].includes(code)) {
+    return true;
+  }
+
+  const message = error && error.message ? error.message : String(error || '');
+  return /no free sessions|remote console is already in use|timed out|timeout/i.test(message);
+}
+
+async function retryStartupStep(label, task) {
+  const delaySeconds = readIntegerEnv('ILO_STARTUP_RETRY_SECONDS', 10);
+  const maxAttempts = readIntegerEnv('ILO_STARTUP_MAX_ATTEMPTS', 0);
+  let attempt = 0;
+
+  while (true) {
+    attempt += 1;
+
+    try {
+      return await task();
+    } catch (error) {
+      if (!isRetryableStartupError(error) || (maxAttempts > 0 && attempt >= maxAttempts)) {
+        throw error;
+      }
+
+      const limit = maxAttempts > 0 ? `/${maxAttempts}` : '';
+      console.warn(
+        `${label} failed (${formatError(error)}). ` +
+          `Retrying in ${delaySeconds}s (attempt ${attempt}${limit})...`
+      );
+      await sleep(delaySeconds * 1000);
+    }
+  }
+}
+
+async function connectTcp(host, port, label, timeoutMs = 10000) {
+  const socket = net.connect({ host, port });
+  socket.setNoDelay(true);
+
+  let timer;
+  try {
+    await Promise.race([
+      once(socket, 'connect'),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} connection timed out`)), timeoutMs);
+      }),
+    ]);
+    return socket;
+  } catch (error) {
+    socket.destroy();
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function safeGtkText(value) {
   return String(value ?? '')
     .replace(/\r\n/g, '\n')
@@ -126,7 +199,7 @@ async function main() {
   Gtk.init();
 
   const client = new RestAPIClient(config.baseUrl);
-  await client.loginSession(config.username, config.password);
+  await retryStartupStep('iLO login', () => client.loginSession(config.username, config.password));
 
   // Initialize Virtual Media Manager
   const vmManager = new VirtualMediaManager(client, config.host, {
@@ -134,30 +207,43 @@ async function main() {
     password: config.password,
   });
   let currentMediaStatus = null;
-  const sessionInfo = await client.getSessionInfo();
+  const sessionInfo = await retryStartupStep('Reading iLO session info', () => client.getSessionInfo());
   vmManager.setSessionInfo(sessionInfo);
 
-  const rcInfo = await client.getRcInfo();
+  const rcInfo = await retryStartupStep('Reading iLO remote console info', () => client.getRcInfo());
   vmManager.setRemoteConsoleInfo(rcInfo);
   console.log(`Connected to ${config.host}. Protocol ${rcInfo.protocolVersion}. Features: ${Array.from(rcInfo.optionalFeatures).join(', ')}`);
 
-  const rcSocket = net.connect({ host: config.host, port: rcInfo.rcPort });
-  rcSocket.setNoDelay(true);
-  await once(rcSocket, 'connect');
-  await negotiateConnection(false, rcSocket, client.sessionKey, rcInfo, {
-    negotiateBusy: async () => {
-      if (config.busyPolicy === 'disconnect') {
-        throw new Error('Remote console is already in use');
-      }
-      console.log(`Remote console busy, using policy: ${config.busyPolicy}`);
-      return config.busyPolicy;
-    },
+  const rcSocket = await retryStartupStep('Opening iLO remote console session', async () => {
+    const socket = await connectTcp(config.host, rcInfo.rcPort, 'Remote console');
+    try {
+      await negotiateConnection(false, socket, client.sessionKey, rcInfo, {
+        negotiateBusy: async () => {
+          if (config.busyPolicy === 'disconnect') {
+            throw new Error('Remote console is already in use');
+          }
+          console.log(`Remote console busy, using policy: ${config.busyPolicy}`);
+          return config.busyPolicy;
+        },
+      });
+      return socket;
+    } catch (error) {
+      socket.destroy();
+      throw error;
+    }
   });
 
-  const cmdSocket = net.connect({ host: config.host, port: rcInfo.rcPort });
-  cmdSocket.setNoDelay(true);
-  await once(cmdSocket, 'connect');
-  await negotiateConnection(true, cmdSocket, client.sessionKey, rcInfo);
+  let cmdSocket = null;
+  try {
+    cmdSocket = await connectTcp(config.host, rcInfo.rcPort, 'Command session');
+    await negotiateConnection(true, cmdSocket, client.sessionKey, rcInfo);
+  } catch (error) {
+    console.warn(`Command session unavailable, continuing with remote console only: ${formatError(error)}`);
+    if (cmdSocket && !cmdSocket.destroyed) {
+      cmdSocket.destroy();
+    }
+    cmdSocket = null;
+  }
 
   let quitting = false;
   let screenSize;
@@ -487,11 +573,9 @@ async function main() {
     dialog.addButton(Gtk.STOCK_OPEN, Gtk.ResponseType.ACCEPT);
 
     const isoFilter = new Gtk.FileFilter();
-    isoFilter.setName('ISO/IMG Images');
+    isoFilter.setName('ISO Images');
     isoFilter.addPattern('*.iso');
     isoFilter.addPattern('*.ISO');
-    isoFilter.addPattern('*.img');
-    isoFilter.addPattern('*.IMG');
     dialog.addFilter(isoFilter);
 
     const allFilter = new Gtk.FileFilter();
@@ -505,6 +589,8 @@ async function main() {
 
       console.log(`Selected file: ${filePath}`);
       updateStatus('Mounting virtual media...');
+      vmButton.sensitive = false;
+      vmUnmountButton.sensitive = false;
       vmManager.insertLocalMedia(filePath, 1).then((deviceStatus) => {
         const fileName = path.basename(filePath);
         const bootArmed = Boolean(deviceStatus && deviceStatus.bootArmed);
@@ -517,10 +603,13 @@ async function main() {
         );
         currentMediaStatus = filePath;
         vmButton.label = 'Unmount ISO';
+        vmButton.sensitive = true;
         vmUnmountButton.sensitive = true;
         console.log(`Successfully mounted ISO: ${fileName}${bootArmed ? ' (boot armed)' : ''}`);
       }).catch((error) => {
         updateStatus(`Failed to mount media: ${formatError(error)}`);
+        vmButton.sensitive = true;
+        vmUnmountButton.sensitive = false;
         console.error(`Mount error: ${error.message}`);
         console.error(`Full error:`, error);
       });
@@ -582,7 +671,9 @@ async function main() {
       rcSocket.end();
     } catch (_error) {}
     try {
-      cmdSocket.end();
+      if (cmdSocket) {
+        cmdSocket.end();
+      }
     } catch (_error) {}
     Gtk.mainQuit();
   });
@@ -637,11 +728,13 @@ async function main() {
     }
   });
 
-  cmdSocket.on('error', (error) => {
-    if (!quitting) {
-      console.error(`Command session error: ${error.message}`);
-    }
-  });
+  if (cmdSocket) {
+    cmdSocket.on('error', (error) => {
+      if (!quitting) {
+        console.error(`Command session error: ${error.message}`);
+      }
+    });
+  }
 
   Gtk.main();
 }
